@@ -1,15 +1,14 @@
 // observe.js
-// Run from terminal: node observe.js [--target facebook|agent]
+// Run from terminal: node observe.js [--target facebook|agent] [--save] [--diff]
 // Takes a screenshot, sends it to Claude, prints observations + suggestions.
+// Follow-up conversation mode lets you ask further questions about the same screenshot.
 
 import fs from "fs";
 import path from "path";
-import { execSync, exec } from "child_process";
-import { promisify } from "util";
-import { createRequire } from "module";
+import os from "os";
+import { execSync } from "child_process";
+import { fileURLToPath } from "url";
 import "dotenv/config";
-
-const execAsync = promisify(exec);
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -17,10 +16,16 @@ const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = "claude-sonnet-4-6";
 const SCREENSHOT_PATH = "/tmp/fb_agent_observe.png";
 
-// Parse --target flag
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const SESSIONS_DIR = path.join(__dirname, "sessions");
+
+// Parse flags
 const args = process.argv.slice(2);
+const flagSave = args.includes("--save");
+const flagDiff = args.includes("--diff");
 const targetFlag = args.find((a) => a.startsWith("--target=") || a === "--target");
-let target = "choose"; // default: ask interactively
+let target = "choose";
 if (targetFlag) {
   target = targetFlag.includes("=") ? targetFlag.split("=")[1] : args[args.indexOf("--target") + 1];
 }
@@ -64,34 +69,46 @@ Be concise. Use these headings:
 `.trim(),
 };
 
+const DIFF_PROMPT = `
+You are comparing two screenshots of the same Facebook surface taken at different times.
+Image 1 is the EARLIER state. Image 2 is the CURRENT state.
+
+Your job:
+1. Describe what changed between the two screenshots (new messages, price updates, status changes, new posts, etc.)
+2. Highlight anything important the user should react to (a reply from a seller, a price drop, a sold tag)
+3. Suggest the next step
+
+Be concise. Use these headings:
+### 🔁 What Changed
+### ⚠️ Worth Noting
+### ➡️ Next Step
+`.trim();
+
 // ─── Screenshot ───────────────────────────────────────────────────────────────
 
-async function takeScreenshot() {
+function takeScreenshot(destPath = SCREENSHOT_PATH) {
   const platform = process.platform;
 
   try {
     if (platform === "darwin") {
-      // macOS — screencapture with interactive window selection
       console.log("\n📸 Click on the window you want to capture...\n");
-      execSync(`screencapture -i -o -t png "${SCREENSHOT_PATH}"`, { stdio: "inherit" });
+      execSync(`screencapture -i -o -t png "${destPath}"`, { stdio: "inherit" });
     } else if (platform === "linux") {
-      // Linux — try scrot first, fallback to import (ImageMagick)
       try {
         console.log("\n📸 Select a window to capture (click on it)...\n");
-        execSync(`scrot -s "${SCREENSHOT_PATH}"`, { stdio: "inherit" });
+        execSync(`scrot -s "${destPath}"`, { stdio: "inherit" });
       } catch {
         console.log("\n📸 Capturing screen with import...\n");
-        execSync(`import "${SCREENSHOT_PATH}"`, { stdio: "inherit" });
+        execSync(`import "${destPath}"`, { stdio: "inherit" });
       }
     } else if (platform === "win32") {
-      // Windows — use PowerShell
       const psScript = `
 Add-Type -AssemblyName System.Windows.Forms
 $screen = [System.Windows.Forms.Screen]::PrimaryScreen
 $bitmap = New-Object System.Drawing.Bitmap($screen.Bounds.Width, $screen.Bounds.Height)
 $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
 $graphics.CopyFromScreen($screen.Bounds.Location, [System.Drawing.Point]::Empty, $screen.Bounds.Size)
-$bitmap.Save("${SCREENSHOT_PATH.replace(/\//g, "\\")}")
+$bitmap.Save("${destPath.replace(/\//g, "\\")}")
 $graphics.Dispose()
 $bitmap.Dispose()
 `;
@@ -100,11 +117,11 @@ $bitmap.Dispose()
       throw new Error(`Unsupported platform: ${platform}`);
     }
   } catch (err) {
-    if (err.message.includes("Unsupported")) throw err;
-    // User may have cancelled the screenshot — check if file exists
+    if (err.message && err.message.includes("Unsupported")) throw err;
+    // Otherwise the user may have cancelled — handled below via file check
   }
 
-  if (!fs.existsSync(SCREENSHOT_PATH)) {
+  if (!fs.existsSync(destPath)) {
     console.log("\n⚠️  No screenshot taken (cancelled or failed). Exiting.\n");
     process.exit(0);
   }
@@ -114,27 +131,30 @@ $bitmap.Dispose()
 
 // ─── Resize for API ───────────────────────────────────────────────────────────
 
-async function prepareImage() {
-  // Resize to max 1568px wide — Claude vision sweet spot, keeps tokens low
+async function prepareImage(filePath = SCREENSHOT_PATH) {
   let imageBuffer;
-
   try {
     const { default: sharp } = await import("sharp");
-    imageBuffer = await sharp(SCREENSHOT_PATH)
+    imageBuffer = await sharp(filePath)
       .resize({ width: 1568, withoutEnlargement: true })
       .png()
       .toBuffer();
   } catch {
-    // If sharp fails, just read the raw file
-    imageBuffer = fs.readFileSync(SCREENSHOT_PATH);
+    imageBuffer = fs.readFileSync(filePath);
   }
-
   return imageBuffer.toString("base64");
 }
 
 // ─── Claude API call ──────────────────────────────────────────────────────────
 
-async function analyzeWithClaude(base64Image, systemPrompt) {
+function imageBlock(base64) {
+  return {
+    type: "image",
+    source: { type: "base64", media_type: "image/png", data: base64 },
+  };
+}
+
+async function callClaude({ systemPrompt, messages }) {
   if (!API_KEY || API_KEY === "your_api_key_here") {
     throw new Error("Missing API key. Add ANTHROPIC_API_KEY to your .env file.");
   }
@@ -150,30 +170,12 @@ async function analyzeWithClaude(base64Image, systemPrompt) {
       model: MODEL,
       max_tokens: 1024,
       system: systemPrompt,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "image",
-              source: {
-                type: "base64",
-                media_type: "image/png",
-                data: base64Image,
-              },
-            },
-            {
-              type: "text",
-              text: "Observe this screenshot and give me your full analysis.",
-            },
-          ],
-        },
-      ],
+      messages,
     }),
   });
 
   if (!response.ok) {
-    const err = await response.json();
+    const err = await response.json().catch(() => ({}));
     throw new Error(err?.error?.message || `API error ${response.status}`);
   }
 
@@ -181,12 +183,44 @@ async function analyzeWithClaude(base64Image, systemPrompt) {
   return data.content[0].text;
 }
 
+async function analyzeWithClaude(base64Image, systemPrompt) {
+  return callClaude({
+    systemPrompt,
+    messages: [
+      {
+        role: "user",
+        content: [
+          imageBlock(base64Image),
+          { type: "text", text: "Observe this screenshot and give me your full analysis." },
+        ],
+      },
+    ],
+  });
+}
+
+async function diffWithClaude(base64Before, base64After) {
+  return callClaude({
+    systemPrompt: DIFF_PROMPT,
+    messages: [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Image 1 (earlier):" },
+          imageBlock(base64Before),
+          { type: "text", text: "Image 2 (current):" },
+          imageBlock(base64After),
+          { type: "text", text: "What changed between these two screenshots?" },
+        ],
+      },
+    ],
+  });
+}
+
 // ─── Interactive target selection ─────────────────────────────────────────────
 
 async function chooseTarget() {
   const { createInterface } = await import("readline");
   const rl = createInterface({ input: process.stdin, output: process.stdout });
-
   return new Promise((resolve) => {
     console.log("What do you want to observe?\n");
     console.log("  1. Facebook (marketplace, group post, messenger)");
@@ -198,13 +232,22 @@ async function chooseTarget() {
   });
 }
 
+async function askQuestion(promptText) {
+  const { createInterface } = await import("readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(promptText, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
 // ─── Pretty print ─────────────────────────────────────────────────────────────
 
-function printResult(text, target) {
+function printResult(text, label) {
   const divider = "─".repeat(60);
-  const label = target === "facebook" ? "Facebook Observer" : "FB Agent Observer";
   const timestamp = new Date().toLocaleTimeString("en-CA", { hour12: false });
-
   console.log(`\n${divider}`);
   console.log(`◈  ${label}  ·  ${timestamp}`);
   console.log(`${divider}\n`);
@@ -212,40 +255,182 @@ function printResult(text, target) {
   console.log(`\n${divider}\n`);
 }
 
+// ─── Clipboard ────────────────────────────────────────────────────────────────
+
+function extractSuggestedMessage(text) {
+  // Matches "### ✉️ Suggested Message" up to the next "### " heading or end.
+  const match = text.match(
+    /###\s*✉️\s*Suggested Message[^\n]*\n([\s\S]*?)(?=\n###\s|$)/
+  );
+  if (!match) return "";
+  return match[1]
+    .replace(/^\s*\(if applicable\)\s*$/gim, "")
+    .trim();
+}
+
+function copyToClipboard(text) {
+  if (!text) return false;
+  const platform = process.platform;
+  try {
+    if (platform === "darwin") {
+      execSync("pbcopy", { input: text });
+    } else if (platform === "linux") {
+      try {
+        execSync("xclip -selection clipboard", { input: text });
+      } catch {
+        execSync("xsel --clipboard --input", { input: text });
+      }
+    } else if (platform === "win32") {
+      execSync("clip", { input: text });
+    } else {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Sessions (save / diff) ───────────────────────────────────────────────────
+
+function ensureSessionsDir() {
+  if (!fs.existsSync(SESSIONS_DIR)) {
+    fs.mkdirSync(SESSIONS_DIR, { recursive: true });
+  }
+}
+
+function timestampSlug() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
+}
+
+function saveSession(targetName, pngBuffer, analysis) {
+  ensureSessionsDir();
+  const slug = `${timestampSlug()}_${targetName}`;
+  const pngPath = path.join(SESSIONS_DIR, `${slug}.png`);
+  const txtPath = path.join(SESSIONS_DIR, `${slug}.txt`);
+  fs.writeFileSync(pngPath, pngBuffer);
+  fs.writeFileSync(txtPath, analysis);
+  return { pngPath, txtPath };
+}
+
+function findLastSession(targetName) {
+  if (!fs.existsSync(SESSIONS_DIR)) return null;
+  const files = fs
+    .readdirSync(SESSIONS_DIR)
+    .filter((f) => f.endsWith(`_${targetName}.png`))
+    .sort();
+  if (files.length === 0) return null;
+  return path.join(SESSIONS_DIR, files[files.length - 1]);
+}
+
+// ─── Conversation follow-up loop ──────────────────────────────────────────────
+
+async function conversationLoop({ systemPrompt, base64Image, firstAnalysis }) {
+  const history = [
+    {
+      role: "user",
+      content: [
+        imageBlock(base64Image),
+        { type: "text", text: "Observe this screenshot and give me your full analysis." },
+      ],
+    },
+    { role: "assistant", content: firstAnalysis },
+  ];
+
+  while (true) {
+    const followUp = (await askQuestion(
+      "💬 Follow up? (type a question or press Enter to exit): "
+    )).trim();
+    if (!followUp) {
+      console.log("\n👋 Done.\n");
+      return;
+    }
+
+    history.push({ role: "user", content: followUp });
+    const reply = await callClaude({ systemPrompt, messages: history });
+    history.push({ role: "assistant", content: reply });
+    printResult(reply, "Follow-up");
+  }
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
+
+async function runDiff(resolvedTarget) {
+  const previous = findLastSession(resolvedTarget);
+  if (!previous) {
+    console.error(
+      `\n❌ No previous saved session for "${resolvedTarget}". Run with --save first.\n`
+    );
+    process.exit(1);
+  }
+  console.log(`\n📂 Comparing against: ${path.basename(previous)}\n`);
+
+  takeScreenshot();
+  console.log("🔍 Sending both images to Claude...\n");
+
+  const [base64Before, base64After] = await Promise.all([
+    prepareImage(previous),
+    prepareImage(SCREENSHOT_PATH),
+  ]);
+
+  const result = await diffWithClaude(base64Before, base64After);
+  printResult(result, `Diff · ${resolvedTarget}`);
+
+  fs.unlinkSync(SCREENSHOT_PATH);
+}
+
+async function runObserve(resolvedTarget) {
+  const systemPrompt = SYSTEM_PROMPTS[resolvedTarget];
+  const label = resolvedTarget === "facebook" ? "Facebook Observer" : "FB Agent Observer";
+  console.log(`🎯 Target: ${resolvedTarget === "facebook" ? "Facebook" : "FB Agent app"}\n`);
+
+  takeScreenshot();
+  console.log("🔍 Sending to Claude...\n");
+
+  const base64Image = await prepareImage();
+  const result = await analyzeWithClaude(base64Image, systemPrompt);
+  printResult(result, label);
+
+  // Auto-copy the suggested message (Facebook target produces one; agent target usually doesn't)
+  const suggested = extractSuggestedMessage(result);
+  if (suggested) {
+    if (copyToClipboard(suggested)) {
+      console.log("✅ Draft message copied to clipboard\n");
+    }
+  }
+
+  // Optionally persist the session before deleting the temp file
+  if (flagSave) {
+    const pngBuffer = fs.readFileSync(SCREENSHOT_PATH);
+    const { pngPath, txtPath } = saveSession(resolvedTarget, pngBuffer, result);
+    console.log(`💾 Saved session:\n   ${pngPath}\n   ${txtPath}\n`);
+  }
+
+  // Conversation follow-up — uses base64 already in memory, no new screenshot
+  await conversationLoop({ systemPrompt, base64Image, firstAnalysis: result });
+
+  if (fs.existsSync(SCREENSHOT_PATH)) fs.unlinkSync(SCREENSHOT_PATH);
+}
 
 async function main() {
   console.log("\n◈  FB Agent Observer\n");
 
-  // Resolve target
   let resolvedTarget = target;
   if (resolvedTarget === "choose") {
     resolvedTarget = await chooseTarget();
   }
-
   if (!["facebook", "agent"].includes(resolvedTarget)) {
     console.error(`Unknown target: "${resolvedTarget}". Use "facebook" or "agent".`);
     process.exit(1);
   }
 
-  const systemPrompt = SYSTEM_PROMPTS[resolvedTarget];
-  console.log(`🎯 Target: ${resolvedTarget === "facebook" ? "Facebook" : "FB Agent app"}\n`);
-
-  // Screenshot
-  await takeScreenshot();
-
-  // Prepare image
-  console.log("🔍 Sending to Claude...\n");
-  const base64Image = await prepareImage();
-
-  // Analyze
-  const result = await analyzeWithClaude(base64Image, systemPrompt);
-
-  // Print
-  printResult(result, resolvedTarget);
-
-  // Cleanup
-  fs.unlinkSync(SCREENSHOT_PATH);
+  if (flagDiff) {
+    await runDiff(resolvedTarget);
+  } else {
+    await runObserve(resolvedTarget);
+  }
 }
 
 main().catch((err) => {

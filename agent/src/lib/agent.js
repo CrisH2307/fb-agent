@@ -34,6 +34,16 @@ const USER_PROFILE = {
 export const NEGOTIATION_STYLES = USER_PROFILE.negotiationStyles;
 
 /**
+ * Extract just the Draft Message section from an agent reply.
+ * Returns "" if the heading isn't present so the TTS layer can skip speaking.
+ */
+export function extractDraftMessage(markdown) {
+  if (!markdown) return "";
+  const match = markdown.match(/###\s*✉️\s*Draft Message\s*\n([\s\S]*?)(?=\n###\s|$)/);
+  return match ? match[1].trim() : "";
+}
+
+/**
  * Build the system prompt for the agent.
  * This is what shapes the agent's entire personality and decision-making.
  */

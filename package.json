@@ -6,7 +6,9 @@
   "scripts": {
     "observe": "node observe.js",
     "observe:fb": "node observe.js --target facebook",
-    "observe:agent": "node observe.js --target agent"
+    "observe:agent": "node observe.js --target agent",
+    "observe:save": "node observe.js --save",
+    "observe:diff": "node observe.js --diff"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
