@@ -1,0 +1,15 @@
+{
+  "name": "fb-agent-observer",
+  "version": "0.1.0",
+  "description": "CLI tool — captures your screen and asks Claude what it sees",
+  "type": "module",
+  "scripts": {
+    "observe": "node observe.js",
+    "observe:fb": "node observe.js --target facebook",
+    "observe:agent": "node observe.js --target agent"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "sharp": "^0.33.4"
+  }
+}
