@@ -4,15 +4,22 @@ import React, { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import { useAgent } from "./hooks/useAgent";
 import { useSpeechInput, useSpeechOutput } from "./hooks/useVoice";
+import { useServerStatus } from "./hooks/useServerStatus";
 import { NEGOTIATION_STYLES, extractDraftMessage } from "./lib/agent";
+import SearchPanel from "./components/SearchPanel";
+import SendConfirm from "./components/SendConfirm";
+import InboxView from "./components/InboxView";
 import "./App.css";
+
+const SERVER_URL = "http://localhost:3001";
 
 // ─── Message Bubble ───────────────────────────────────────────────────────────
 
-function MessageBubble({ message, onReplay, canReplay }) {
+function MessageBubble({ message, onReplay, canReplay, onSendViaAgent }) {
   const isUser = message.role === "user";
   const draft = !isUser ? extractDraftMessage(message.content) : "";
   const showReplay = !isUser && canReplay && draft.length > 0;
+  const showSendAgent = !isUser && !!onSendViaAgent && draft.length > 0;
 
   return (
     <div className={`bubble-wrapper ${isUser ? "bubble-user" : "bubble-agent"}`}>
@@ -26,14 +33,27 @@ function MessageBubble({ message, onReplay, canReplay }) {
           </div>
         )}
       </div>
-      {showReplay && (
-        <button
-          className="replay-btn"
-          onClick={() => onReplay(draft)}
-          title="Replay draft message"
-        >
-          🔊 Replay
-        </button>
+      {(showReplay || showSendAgent) && (
+        <div className="bubble-actions">
+          {showReplay && (
+            <button
+              className="replay-btn"
+              onClick={() => onReplay(draft)}
+              title="Replay draft message"
+            >
+              🔊 Replay
+            </button>
+          )}
+          {showSendAgent && (
+            <button
+              className="send-agent-btn"
+              onClick={() => onSendViaAgent(draft)}
+              title="Send this message via Facebook Messenger"
+            >
+              ✉️ Send via Agent
+            </button>
+          )}
+        </div>
       )}
     </div>
   );
@@ -61,9 +81,51 @@ function StyleSelector({ value, onChange }) {
   );
 }
 
+// ─── Server Badge ─────────────────────────────────────────────────────────────
+
+function ServerBadge({ connected, loggedIn, recheck }) {
+  const [signingIn, setSigningIn] = useState(false);
+
+  const handleSignIn = async () => {
+    setSigningIn(true);
+    try {
+      await fetch(`${SERVER_URL}/login`, { method: "POST" });
+      setTimeout(recheck, 5000);
+    } catch {
+      // ignore
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  if (!connected) return null;
+
+  if (loggedIn) {
+    return (
+      <div className="server-badge">
+        <span className="server-dot server-dot-green" />
+        <span className="server-badge-text">FB Connected</span>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      className="server-badge server-badge-login"
+      onClick={handleSignIn}
+      disabled={signingIn}
+      type="button"
+      title="Click to open Facebook login window"
+    >
+      <span className="server-dot server-dot-amber" />
+      <span className="server-badge-text">{signingIn ? "Opening…" : "Sign in to FB"}</span>
+    </button>
+  );
+}
+
 // ─── Input Area ───────────────────────────────────────────────────────────────
 
-function InputArea({ value, onChange, onSend, isLoading, isFirstMessage }) {
+function InputArea({ value, onChange, onSend, isLoading, isFirstMessage, serverConnected }) {
   const textareaRef = useRef(null);
 
   const speech = useSpeechInput({
@@ -97,16 +159,18 @@ function InputArea({ value, onChange, onSend, isLoading, isFirstMessage }) {
     }
   }, [value]);
 
+  const placeholder = isFirstMessage
+    ? serverConnected
+      ? "Paste a post or search above…"
+      : "Paste a Facebook post here (rental, marketplace item, job posting...)"
+    : "Reply to the agent — e.g. 'too high, offer $15' or 'ask when it's available'";
+
   return (
     <div className="input-area">
       <textarea
         ref={textareaRef}
         className="input-textarea"
-        placeholder={
-          isFirstMessage
-            ? "Paste a Facebook post here (rental, marketplace item, job posting...)"
-            : "Reply to the agent — e.g. 'too high, offer $15' or 'ask when it's available'"
-        }
+        placeholder={placeholder}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={handleKeyDown}
@@ -158,11 +222,21 @@ export default function App() {
   const { messages, isLoading, error, negotiationStyle, setNegotiationStyle, sendMessage, reset } =
     useAgent();
   const voiceOut = useSpeechOutput();
+  const { connected, loggedIn, recheck } = useServerStatus();
+
   const [inputValue, setInputValue] = useState("");
+  const [currentPostUrl, setCurrentPostUrl] = useState(null);
+  const [currentPosterName, setCurrentPosterName] = useState("");
+  const [confirmSend, setConfirmSend] = useState(null); // { message, threadUrl, recipientName }
+  const [showInbox, setShowInbox] = useState(false);
+  const [findingThread, setFindingThread] = useState(false);
+
   const bottomRef = useRef(null);
   const lastSpokenIndexRef = useRef(-1);
 
   const isFirstMessage = messages.length === 0;
+  const showSearch = connected && loggedIn && isFirstMessage;
+  const canSendViaAgent = connected && loggedIn && !!currentPostUrl;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -188,6 +262,34 @@ export default function App() {
     lastSpokenIndexRef.current = -1;
     reset();
     setInputValue("");
+    setCurrentPostUrl(null);
+    setCurrentPosterName("");
+    setConfirmSend(null);
+  };
+
+  const handleSendViaAgent = async (draftMessage) => {
+    if (!currentPostUrl) return;
+    setFindingThread(true);
+    try {
+      const res = await fetch(
+        `${SERVER_URL}/message/thread?url=${encodeURIComponent(currentPostUrl)}`,
+        { signal: AbortSignal.timeout(25000) }
+      );
+      const data = await res.json();
+      setConfirmSend({
+        message: draftMessage,
+        threadUrl: data.threadUrl || null,
+        recipientName: data.recipientName || currentPosterName,
+      });
+    } catch {
+      setConfirmSend({
+        message: draftMessage,
+        threadUrl: null,
+        recipientName: currentPosterName,
+      });
+    } finally {
+      setFindingThread(false);
+    }
   };
 
   return (
@@ -203,6 +305,16 @@ export default function App() {
         </div>
         <div className="header-right">
           <StyleSelector value={negotiationStyle} onChange={setNegotiationStyle} />
+          <ServerBadge connected={connected} loggedIn={loggedIn} recheck={recheck} />
+          {connected && loggedIn && (
+            <button
+              className="inbox-btn"
+              onClick={() => setShowInbox(true)}
+              type="button"
+            >
+              Inbox
+            </button>
+          )}
           {voiceOut.isSupported && (
             <button
               className={`voice-toggle-btn ${voiceOut.isMuted ? "" : "voice-toggle-btn-on"}`}
@@ -226,7 +338,9 @@ export default function App() {
         {isFirstMessage ? (
           <div className="empty-state">
             <div className="empty-icon">📋</div>
-            <h2 className="empty-title">Paste a Facebook post</h2>
+            <h2 className="empty-title">
+              {showSearch ? "Search or paste a Facebook post" : "Paste a Facebook post"}
+            </h2>
             <p className="empty-desc">
               Rental listing, Marketplace item, job post, or anything from a Vietnamese community
               group. The agent will summarize it, assess the deal, and draft a message you can send.
@@ -246,6 +360,7 @@ export default function App() {
                 message={msg}
                 onReplay={voiceOut.speak}
                 canReplay={voiceOut.isSupported}
+                onSendViaAgent={canSendViaAgent && !findingThread ? handleSendViaAgent : null}
               />
             ))}
             {isLoading && (
@@ -261,6 +376,9 @@ export default function App() {
                 </div>
               </div>
             )}
+            {findingThread && (
+              <div className="finding-thread-hint">Finding Messenger thread…</div>
+            )}
             {error && (
               <div className="error-banner">
                 ⚠️ {error}
@@ -271,16 +389,41 @@ export default function App() {
         )}
       </main>
 
+      {/* Send confirmation card (above footer) */}
+      {confirmSend && (
+        <SendConfirm
+          message={confirmSend.message}
+          recipientName={confirmSend.recipientName}
+          threadUrl={confirmSend.threadUrl}
+          onConfirm={() => setConfirmSend(null)}
+          onEdit={(msg) => { setInputValue(msg); setConfirmSend(null); }}
+          onCancel={() => setConfirmSend(null)}
+        />
+      )}
+
       {/* Input */}
       <footer className="footer">
+        {showSearch && (
+          <SearchPanel
+            onLoad={(text, url, posterName) => {
+              setInputValue(text);
+              setCurrentPostUrl(url || null);
+              setCurrentPosterName(posterName || "");
+            }}
+          />
+        )}
         <InputArea
           value={inputValue}
           onChange={setInputValue}
           onSend={sendMessage}
           isLoading={isLoading}
           isFirstMessage={isFirstMessage}
+          serverConnected={connected && loggedIn}
         />
       </footer>
+
+      {/* Inbox modal */}
+      {showInbox && <InboxView onClose={() => setShowInbox(false)} />}
     </div>
   );
 }
